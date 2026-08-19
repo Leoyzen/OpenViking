@@ -1267,6 +1267,9 @@ impl PathLockManager {
 
     /// Ensure the parent directory of a lock path exists.
     async fn ensure_lock_dir(&self, lock_path: &str) -> PathLockResult<()> {
+        if !self.provider.requires_lock_dir() {
+            return Ok(());
+        }
         if let Some(parent_end) = lock_path.rfind('/') {
             let parent = &lock_path[..parent_end];
             if parent.is_empty() || parent == "/" {

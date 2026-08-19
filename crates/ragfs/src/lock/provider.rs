@@ -52,6 +52,13 @@ pub trait PathLockProvider: Send + Sync {
 
     /// Scan all descendant lock paths under `root`.
     async fn scan_descendant_locks(&self, root: &str) -> PathLockResult<Vec<String>>;
+
+    /// Whether the provider needs filesystem directories to exist for lock
+    /// paths. Memory providers keep tokens in a HashMap and never touch the
+    /// filesystem, so `ensure_lock_dir` can be skipped entirely.
+    fn requires_lock_dir(&self) -> bool {
+        true
+    }
 }
 
 // ── Memory provider ──
@@ -80,6 +87,10 @@ impl Default for MemoryPathLockProvider {
 impl PathLockProvider for MemoryPathLockProvider {
     fn name(&self) -> &'static str {
         "memory"
+    }
+
+    fn requires_lock_dir(&self) -> bool {
+        false
     }
 
     async fn read_token(&self, lock_path: &str) -> PathLockResult<Option<LockToken>> {

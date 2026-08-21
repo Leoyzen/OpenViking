@@ -196,6 +196,12 @@ where
         .is_some_and(|response| matches!(response.status().as_u16(), 409 | 412))
 }
 
+/// Compare ETags case-insensitively.
+/// OSS returns uppercase ETags while AWS S3 returns lowercase.
+fn etag_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 fn format_generic_s3_error(
     op: &str,
     bucket: &str,
@@ -716,6 +722,27 @@ impl S3Client {
 
     /// Upload an object only when its ETag still matches `etag`.
     pub async fn put_object_if_match(&self, key: &str, data: Vec<u8>, etag: &str) -> Result<bool> {
+        if matches!(self.s3_vendor, S3Vendor::AliyunOss) {
+            // OSS doesn't support If-Match on PutObject.
+            // Use read-verify-write: GET current ETag, compare, then unconditional PUT.
+            // The PathLock already ensures mutual exclusion, so the non-atomic
+            // read-verify-write is safe under the existing lock.
+            let current = self.get_object_with_etag(key).await?;
+            match current {
+                Some((_, current_etag)) => {
+                    if !etag_eq(&current_etag, etag) {
+                        return Ok(false); // ETag mismatch — CAS failed
+                    }
+                }
+                None => {
+                    return Ok(false); // Object doesn't exist — CAS failed
+                }
+            }
+            // ETag matches — proceed with unconditional PUT
+            self.put_object(key, data).await?;
+            return Ok(true);
+        }
+
         let mut request = self
             .client
             .put_object()
@@ -809,6 +836,26 @@ impl S3Client {
 
     /// Delete a single object only when its ETag still matches `etag`.
     pub async fn delete_object_if_match(&self, key: &str, etag: &str) -> Result<bool> {
+        if matches!(self.s3_vendor, S3Vendor::AliyunOss) {
+            // OSS doesn't support If-Match on DeleteObject.
+            // Read-verify-delete: GET current ETag, compare, then unconditional DELETE.
+            let current = self.get_object_with_etag(key).await?;
+            match current {
+                Some((_, current_etag)) => {
+                    if !etag_eq(&current_etag, etag) {
+                        return Ok(false); // ETag mismatch — CAS failed
+                    }
+                }
+                None => {
+                    return Ok(false); // Object doesn't exist — CAS failed
+                }
+            }
+            // ETag matches — proceed with unconditional DELETE
+            self.delete_object(key).await?;
+            return Ok(true);
+        }
+
+        // Standard S3: use If-Match header
         self.client
             .delete_object()
             .bucket(&self.bucket)

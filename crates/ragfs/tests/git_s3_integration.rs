@@ -147,6 +147,11 @@ fn load_s3_config() -> Option<S3Config> {
         secret_access_key,
         use_path_style,
         cas_mode,
+        conditional_write_mode: s3
+            .get("conditional_write_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("standard")
+            .to_string(),
     })
 }
 

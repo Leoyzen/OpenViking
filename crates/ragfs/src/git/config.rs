@@ -47,6 +47,9 @@ pub struct GitS3ConfigPy {
     pub redis_lock_url: Option<String>,
     #[serde(default = "default_true")]
     pub use_path_style: bool,
+    /// Conditional write mode: "standard" or "oss_forbid_overwrite".
+    #[serde(default = "default_conditional_write_mode")]
+    pub conditional_write_mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +94,9 @@ fn default_s3_prefix() -> String {
 }
 fn default_cas_mode() -> String {
     "native".to_string()
+}
+fn default_conditional_write_mode() -> String {
+    "standard".to_string()
 }
 fn default_true() -> bool {
     true
@@ -146,6 +152,7 @@ mod tests {
         assert_eq!(s3.prefix, ".ovgit");
         assert_eq!(s3.region, "us-west-2");
         assert_eq!(s3.cas_mode, "native");
+        assert_eq!(s3.conditional_write_mode, "standard");
         assert!(cfg.tuning.commit_index_enabled);
     }
 

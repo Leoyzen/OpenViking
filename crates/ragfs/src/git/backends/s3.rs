@@ -49,6 +49,9 @@ pub struct S3Config {
     pub use_path_style: bool,
     /// CAS mode for ref updates
     pub cas_mode: CasMode,
+    /// Conditional write mode: "standard" (If-None-Match) or
+    /// "oss_forbid_overwrite" (x-oss-forbid-overwrite).
+    pub conditional_write_mode: String,
 }
 
 impl Default for S3Config {
@@ -62,6 +65,7 @@ impl Default for S3Config {
             secret_access_key: None,
             use_path_style: true,
             cas_mode: CasMode::Native,
+            conditional_write_mode: "standard".to_string(),
         }
     }
 }
@@ -71,6 +75,7 @@ pub struct S3ObjectStore {
     client: Arc<aws_sdk_s3::Client>,
     bucket: String,
     prefix: String,
+    conditional_write_mode: String,
 }
 
 impl S3ObjectStore {
@@ -80,6 +85,7 @@ impl S3ObjectStore {
             client,
             bucket,
             prefix,
+            conditional_write_mode: "standard".to_string(),
         }
     }
 
@@ -89,6 +95,19 @@ impl S3ObjectStore {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
             .force_path_style(config.use_path_style);
+
+        // OSS doesn't support the SDK's default checksum headers
+        // (x-amz-sdk-checksum-algorithm, x-amz-checksum-crc32) introduced in
+        // aws-sdk-rust >= 1.69. Disable them to avoid 400 InvalidArgument errors.
+        if config.conditional_write_mode == "oss_forbid_overwrite" {
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                );
+        }
 
         // Set endpoint if provided (MinIO, LocalStack, TOS)
         if let Some(ep) = config.endpoint {
@@ -104,7 +123,12 @@ impl S3ObjectStore {
         let s3_config = s3_config_builder.build();
         let client = Arc::new(aws_sdk_s3::Client::from_conf(s3_config));
 
-        Ok(Self::new(client, config.bucket, config.prefix))
+        Ok(Self {
+            client,
+            bucket: config.bucket,
+            prefix: config.prefix,
+            conditional_write_mode: config.conditional_write_mode,
+        })
     }
 
     /// Build the full S3 key for a Git object
@@ -123,32 +147,50 @@ impl ObjectStore for S3ObjectStore {
     ) -> Result<(), ObjectStoreError> {
         let key = self.object_key(account, oid);
 
-        // Use If-None-Match: "*" to ensure idempotency - only write if not exists
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(zlib_body.to_vec().into())
-            .if_none_match("*")
-            .send()
-            .await
-        {
+        // Check if OSS mode — use x-oss-forbid-overwrite instead of If-None-Match
+        let is_oss = self.conditional_write_mode == "oss_forbid_overwrite";
+
+        let send_result = if is_oss {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(zlib_body.to_vec().into())
+                .customize()
+                .mutate_request(|req| {
+                    req.headers_mut()
+                        .insert("x-oss-forbid-overwrite", "true");
+                })
+                .send()
+                .await
+        } else {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(zlib_body.to_vec().into())
+                .if_none_match("*")
+                .send()
+                .await
+        };
+
+        match send_result {
             Ok(_) => Ok(()),
             Err(aws_sdk_s3::error::SdkError::ServiceError(err)) => {
-                // Check if the error indicates object already exists
                 let err_str = format!("{:?}", err);
-                if err_str.to_lowercase().contains("preconditionfailed")
-                    || err_str.to_lowercase().contains("412")
-                    || err_str.to_lowercase().contains("not modified")
+                let lower = err_str.to_lowercase();
+                // Check for conditional failure (S3: PreconditionFailed/412,
+                // OSS: FileAlreadyExists/409)
+                if lower.contains("preconditionfailed")
+                    || lower.contains("412")
+                    || lower.contains("not modified")
+                    || lower.contains("filealreadyexists")
+                    || lower.contains("409")
                 {
-                    // Object already exists - that's fine for idempotency
+                    // Object already exists — idempotent success
                     Ok(())
                 } else {
-                    Err(ObjectStoreError::Backend(format!(
-                        "S3 put error: {:?}",
-                        err
-                    )))
+                    Err(ObjectStoreError::Backend(format!("S3 put error: {:?}", err)))
                 }
             }
             Err(err) => Err(ObjectStoreError::Backend(format!("S3 put error: {:?}", err))),
@@ -280,6 +322,7 @@ pub struct S3RefStore {
     bucket: String,
     prefix: String,
     cas_mode: CasMode,
+    conditional_write_mode: String,
 }
 
 impl S3RefStore {
@@ -290,6 +333,7 @@ impl S3RefStore {
             bucket,
             prefix,
             cas_mode: CasMode::Native,
+            conditional_write_mode: "standard".to_string(),
         }
     }
 
@@ -305,6 +349,7 @@ impl S3RefStore {
             bucket,
             prefix,
             cas_mode,
+            conditional_write_mode: "standard".to_string(),
         }
     }
 
@@ -314,6 +359,19 @@ impl S3RefStore {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
             .force_path_style(config.use_path_style);
+
+        // OSS doesn't support the SDK's default checksum headers
+        // (x-amz-sdk-checksum-algorithm, x-amz-checksum-crc32) introduced in
+        // aws-sdk-rust >= 1.69. Disable them to avoid 400 InvalidArgument errors.
+        if config.conditional_write_mode == "oss_forbid_overwrite" {
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                );
+        }
 
         // Set endpoint if provided (MinIO, LocalStack, TOS)
         if let Some(ep) = config.endpoint {
@@ -329,12 +387,13 @@ impl S3RefStore {
         let s3_config = s3_config_builder.build();
         let client = Arc::new(aws_sdk_s3::Client::from_conf(s3_config));
 
-        Ok(Self::with_cas_mode(
+        Ok(Self {
             client,
-            config.bucket,
-            config.prefix,
-            config.cas_mode,
-        ))
+            bucket: config.bucket,
+            prefix: config.prefix,
+            cas_mode: config.cas_mode,
+            conditional_write_mode: config.conditional_write_mode,
+        })
     }
 
     /// Build the full S3 key for a Git ref
@@ -410,37 +469,85 @@ impl S3RefStore {
 
         // Prepare the conditional put request
         let body = format!("{}\n", new.to_hex());
-        let mut put_builder = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body.into_bytes().into());
+        let is_oss = self.conditional_write_mode == "oss_forbid_overwrite";
 
-        put_builder = match (current_etag, expected) {
-            (Some(etag), Some(_)) => {
-                // Existing ref - use If-Match with the current ETag
-                put_builder.if_match(etag)
+        let send_result = if is_oss {
+            match (current_etag, expected) {
+                (Some(_), Some(_)) => {
+                    // Existing ref — OSS doesn't support If-Match on PutObject.
+                    // We already verified the value matches above, so
+                    // unconditional PUT is safe under the existing lock.
+                    self.client
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .body(body.into_bytes().into())
+                        .send()
+                        .await
+                }
+                (None, None) => {
+                    // New ref — use x-oss-forbid-overwrite instead of If-None-Match
+                    self.client
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .body(body.into_bytes().into())
+                        .customize()
+                        .mutate_request(|req| {
+                            req.headers_mut()
+                                .insert("x-oss-forbid-overwrite", "true");
+                        })
+                        .send()
+                        .await
+                }
+                _ => {
+                    return Err(RefStoreError::Conflict {
+                        expected,
+                        actual: current_value,
+                    });
+                }
             }
-            (None, None) => {
-                // New ref - use If-None-Match: "*" to ensure it doesn't exist
-                put_builder.if_none_match("*")
-            }
-            _ => {
-                // This shouldn't happen after our check, but just in case
-                return Err(RefStoreError::Conflict {
-                    expected,
-                    actual: current_value,
-                });
+        } else {
+            // Standard S3: use conditional headers as before
+            match (current_etag, expected) {
+                (Some(etag), Some(_)) => {
+                    self.client
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .body(body.into_bytes().into())
+                        .if_match(etag)
+                        .send()
+                        .await
+                }
+                (None, None) => {
+                    self.client
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .body(body.into_bytes().into())
+                        .if_none_match("*")
+                        .send()
+                        .await
+                }
+                _ => {
+                    return Err(RefStoreError::Conflict {
+                        expected,
+                        actual: current_value,
+                    });
+                }
             }
         };
 
-        match put_builder.send().await {
+        match send_result {
             Ok(_) => Ok(()),
             Err(aws_sdk_s3::error::SdkError::ServiceError(err)) => {
                 let err_str = format!("{:?}", err);
-                if err_str.to_lowercase().contains("preconditionfailed")
-                    || err_str.to_lowercase().contains("412")
+                let lower = err_str.to_lowercase();
+                if lower.contains("preconditionfailed")
+                    || lower.contains("412")
+                    || lower.contains("filealreadyexists")
+                    || lower.contains("409")
                 {
                     // Conditional check failed - re-read and report conflict
                     let actual = self.read_ref_opt(account, ref_name).await?.map(|(oid, _)| oid);
@@ -585,6 +692,19 @@ impl S3IndexStore {
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
             .force_path_style(config.use_path_style);
+
+        // OSS doesn't support the SDK's default checksum headers
+        // (x-amz-sdk-checksum-algorithm, x-amz-checksum-crc32) introduced in
+        // aws-sdk-rust >= 1.69. Disable them to avoid 400 InvalidArgument errors.
+        if config.conditional_write_mode == "oss_forbid_overwrite" {
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                );
+        }
 
         if let Some(ep) = config.endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(ep);
@@ -758,6 +878,7 @@ mod tests {
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.use_path_style, true);
         assert_eq!(config.cas_mode, CasMode::Native);
+        assert_eq!(config.conditional_write_mode, "standard");
     }
 
     #[test]

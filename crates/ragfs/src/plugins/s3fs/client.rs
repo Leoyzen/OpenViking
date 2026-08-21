@@ -166,6 +166,12 @@ where
         .is_some_and(|response| matches!(response.status().as_u16(), 409 | 412))
 }
 
+/// Compare ETags case-insensitively.
+/// OSS returns uppercase ETags while AWS S3 returns lowercase.
+fn etag_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 fn format_generic_s3_error(
     op: &str,
     bucket: &str,
@@ -732,37 +738,62 @@ impl S3Client {
 
     /// Upload an object only when its ETag still matches `etag`.
     pub async fn put_object_if_match(&self, key: &str, data: Vec<u8>, etag: &str) -> Result<bool> {
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_match(etag)
-            .body(ByteStream::from(data));
+        match self.conditional_write_mode {
+            ConditionalWriteMode::Standard => {
+                // Standard S3: use If-Match header
+                let mut request = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .if_match(etag)
+                    .body(ByteStream::from(data));
 
-        if self.auto_detect_content_type {
-            if let Some(content_type) = detect_content_type_for_key(key) {
-                request = request.content_type(content_type);
+                if self.auto_detect_content_type {
+                    if let Some(content_type) = detect_content_type_for_key(key) {
+                        request = request.content_type(content_type);
+                    }
+                }
+
+                request.send().await.map_err(|e| {
+                    if is_s3_conditional_failure(&e) {
+                        Error::AlreadyExists(key.to_string())
+                    } else {
+                        format_sdk_s3_error(
+                            "PutObjectIfMatch",
+                            &format!("bucket={} key={key}", self.bucket),
+                            &e,
+                        )
+                    }
+                }).map(|_| true).or_else(|e| {
+                    if matches!(e, Error::AlreadyExists(_)) {
+                        Ok(false)
+                    } else {
+                        Err(e)
+                    }
+                })
+            }
+            ConditionalWriteMode::OssForbidOverwrite => {
+                // OSS doesn't support If-Match on PutObject.
+                // Use read-verify-write: GET current ETag, compare, then unconditional PUT.
+                // The PathLock already ensures mutual exclusion, so the non-atomic
+                // read-verify-write is safe under the existing lock.
+                let current = self.get_object_with_etag(key).await?;
+                match current {
+                    Some((_, current_etag)) => {
+                        if !etag_eq(&current_etag, etag) {
+                            return Ok(false); // ETag mismatch — CAS failed
+                        }
+                    }
+                    None => {
+                        return Ok(false); // Object doesn't exist — CAS failed
+                    }
+                }
+                // ETag matches — proceed with unconditional PUT
+                self.put_object(key, data).await?;
+                Ok(true)
             }
         }
-
-        request.send().await.map_err(|e| {
-            if is_s3_conditional_failure(&e) {
-                Error::AlreadyExists(key.to_string())
-            } else {
-                format_sdk_s3_error(
-                    "PutObjectIfMatch",
-                    &format!("bucket={} key={key}", self.bucket),
-                    &e,
-                )
-            }
-        }).map(|_| true).or_else(|e| {
-            if matches!(e, Error::AlreadyExists(_)) {
-                Ok(false)
-            } else {
-                Err(e)
-            }
-        })
     }
 
     /// Delete a single object
@@ -786,32 +817,55 @@ impl S3Client {
 
     /// Delete a single object only when its ETag still matches `etag`.
     pub async fn delete_object_if_match(&self, key: &str, etag: &str) -> Result<bool> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_match(etag)
-            .send()
-            .await
-            .map_err(|e| {
-                if is_s3_conditional_failure(&e) {
-                    Error::AlreadyExists(key.to_string())
-                } else {
-                    format_sdk_s3_error(
-                        "DeleteObjectIfMatch",
-                        &format!("bucket={} key={key}", self.bucket),
-                        &e,
-                    )
+        match self.conditional_write_mode {
+            ConditionalWriteMode::Standard => {
+                // Standard S3: use If-Match header
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .if_match(etag)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        if is_s3_conditional_failure(&e) {
+                            Error::AlreadyExists(key.to_string())
+                        } else {
+                            format_sdk_s3_error(
+                                "DeleteObjectIfMatch",
+                                &format!("bucket={} key={key}", self.bucket),
+                                &e,
+                            )
+                        }
+                    })
+                    .map(|_| true)
+                    .or_else(|e| {
+                        if matches!(e, Error::AlreadyExists(_)) {
+                            Ok(false)
+                        } else {
+                            Err(e)
+                        }
+                    })
+            }
+            ConditionalWriteMode::OssForbidOverwrite => {
+                // OSS doesn't support If-Match on DeleteObject.
+                // Read-verify-delete: GET current ETag, compare, then unconditional DELETE.
+                let current = self.get_object_with_etag(key).await?;
+                match current {
+                    Some((_, current_etag)) => {
+                        if !etag_eq(&current_etag, etag) {
+                            return Ok(false); // ETag mismatch — CAS failed
+                        }
+                    }
+                    None => {
+                        return Ok(false); // Object doesn't exist — CAS failed
+                    }
                 }
-            })
-            .map(|_| true)
-            .or_else(|e| {
-                if matches!(e, Error::AlreadyExists(_)) {
-                    Ok(false)
-                } else {
-                    Err(e)
-                }
-            })
+                // ETag matches — proceed with unconditional DELETE
+                self.delete_object(key).await?;
+                Ok(true)
+            }
+        }
     }
 
     /// Batch delete objects (up to 1000 per call)

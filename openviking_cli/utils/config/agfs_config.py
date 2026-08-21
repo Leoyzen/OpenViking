@@ -74,6 +74,16 @@ class S3Config(BaseModel):
         "for DeleteObjects but AWS SDK v2 does not send it by default. Defaults to False.",
     )
 
+    conditional_write_mode: Literal["standard", "oss_forbid_overwrite"] = Field(
+        default="standard",
+        description=(
+            "Strategy for S3 conditional writes (create-if-not-exists). "
+            "'standard' uses If-None-Match: * (AWS S3, MinIO). "
+            "'oss_forbid_overwrite' uses x-oss-forbid-overwrite: true (Alibaba Cloud OSS). "
+            "Defaults to 'standard'."
+        ),
+    )
+
     normalize_encoding_chars: str = Field(
         default="?#%+@",
         description="Characters to escape in S3 object keys as !HH hexadecimal bytes. "

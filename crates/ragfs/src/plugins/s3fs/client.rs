@@ -156,7 +156,7 @@ where
 
     if matches!(
         service_err.err().code(),
-        Some("PreconditionFailed" | "ConditionalRequestConflict")
+        Some("PreconditionFailed" | "ConditionalRequestConflict" | "FileAlreadyExists")
     ) {
         return true;
     }
@@ -307,6 +307,26 @@ impl DirectoryMarkerMode {
     }
 }
 
+/// Strategy for conditional writes (create-if-not-exists).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ConditionalWriteMode {
+    /// Standard S3: use If-None-Match: * header
+    #[default]
+    Standard,
+    /// Alibaba OSS: use x-oss-forbid-overwrite: true header
+    /// OSS does not support If-None-Match on PutObject (returns 400 NotImplemented).
+    OssForbidOverwrite,
+}
+
+impl ConditionalWriteMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "oss_forbid_overwrite" => Self::OssForbidOverwrite,
+            _ => Self::Standard,
+        }
+    }
+}
+
 /// Object metadata from HeadObject
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectMeta {
@@ -367,6 +387,7 @@ pub struct S3Client {
     prefix: String,
     normalize_encoding_chars: String,
     marker_mode: DirectoryMarkerMode,
+    conditional_write_mode: ConditionalWriteMode,
     disable_batch_delete: bool,
     auto_detect_content_type: bool,
 }
@@ -453,6 +474,12 @@ impl S3Client {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let conditional_write_mode = config
+            .get("conditional_write_mode")
+            .and_then(|v| v.as_string())
+            .map(|s| ConditionalWriteMode::from_str(s))
+            .unwrap_or_default();
+
         let auto_detect_content_type = config
             .get("auto_detect_content_type")
             .and_then(|v| v.as_bool())
@@ -484,6 +511,7 @@ impl S3Client {
             prefix,
             normalize_encoding_chars,
             marker_mode,
+            conditional_write_mode,
             disable_batch_delete,
             auto_detect_content_type,
         })
@@ -655,8 +683,17 @@ impl S3Client {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .if_none_match("*")
             .body(ByteStream::from(data));
+
+        match self.conditional_write_mode {
+            ConditionalWriteMode::Standard => {
+                request = request.if_none_match("*");
+            }
+            ConditionalWriteMode::OssForbidOverwrite => {
+                // OSS doesn't support If-None-Match on PutObject;
+                // use x-oss-forbid-overwrite header instead (applied below via customize()).
+            }
+        }
 
         if self.auto_detect_content_type {
             if let Some(content_type) = detect_content_type_for_key(key) {
@@ -664,7 +701,21 @@ impl S3Client {
             }
         }
 
-        request.send().await.map_err(|e| {
+        let send_result = match self.conditional_write_mode {
+            ConditionalWriteMode::Standard => request.send().await,
+            ConditionalWriteMode::OssForbidOverwrite => {
+                request
+                    .customize()
+                    .mutate_request(|req| {
+                        req.headers_mut()
+                            .insert("x-oss-forbid-overwrite", "true");
+                    })
+                    .send()
+                    .await
+            }
+        };
+
+        send_result.map_err(|e| {
             if is_s3_conditional_failure(&e) {
                 Error::already_exists(key)
             } else {

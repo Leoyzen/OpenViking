@@ -315,7 +315,7 @@ impl PathLockProvider for FilesystemPathLockProvider {
     }
 
     async fn try_create_token(&self, lock_path: &str, token: &LockToken) -> PathLockResult<()> {
-        use crate::core::WriteFlag;
+        use crate::core::{Error, WriteFlag};
 
         let encoded = LockTokenCodec::encode(token);
         match self
@@ -324,7 +324,14 @@ impl PathLockProvider for FilesystemPathLockProvider {
             .await
         {
             Ok(_) => Ok(()),
-            Err(_) => {
+            Err(e) => {
+                // CreateNew failed — check if it's a conflict (AlreadyExists) or a real I/O error.
+                if !matches!(e, Error::AlreadyExists(_)) {
+                    // Not a conflict — preserve the underlying error for diagnostics.
+                    return Err(PathLockError::Io(format!(
+                        "failed to create lock token at {lock_path}: {e}"
+                    )));
+                }
                 // Already exists — read and check if stale.
                 let existing = self.read_token(lock_path).await?;
                 match existing {

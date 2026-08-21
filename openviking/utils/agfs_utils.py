@@ -320,6 +320,7 @@ def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
         if hasattr(directory_marker_mode, "value")
         else directory_marker_mode,
         "disable_batch_delete": _get_config_value(s3_config, "disable_batch_delete", False),
+        "conditional_write_mode": _get_config_value(s3_config, "conditional_write_mode", "standard"),
         "normalize_encoding_chars": _get_config_value(
             s3_config, "normalize_encoding_chars", "?#%+@"
         ),

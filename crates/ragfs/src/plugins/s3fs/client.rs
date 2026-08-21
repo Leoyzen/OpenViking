@@ -503,6 +503,19 @@ impl S3Client {
             .region(Region::new(region))
             .force_path_style(use_path_style);
 
+        // OSS doesn't support the SDK's default checksum headers
+        // (x-amz-sdk-checksum-algorithm, x-amz-checksum-crc32) introduced in
+        // aws-sdk-rust >= 1.69. Disable them to avoid 400 InvalidArgument errors.
+        if matches!(s3_vendor, S3Vendor::AliyunOss) {
+            s3_config_builder = s3_config_builder
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                );
+        }
+
         // Set endpoint if provided (MinIO, LocalStack, TOS)
         if let Some(ep) = endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(ep.to_string());

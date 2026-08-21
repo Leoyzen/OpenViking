@@ -79,6 +79,15 @@ class S3Config(BaseModel):
         "for DeleteObjects but AWS SDK v2 does not send it by default. Defaults to False.",
     )
 
+    conditional_write_mode: Literal["standard", "oss_forbid_overwrite"] = Field(
+        default="standard",
+        description=(
+            "Deprecated alias for s3_vendor: 'oss_forbid_overwrite' is translated to "
+            "s3_vendor='aliyun_oss' when s3_vendor is left at its default. "
+            "Prefer setting s3_vendor directly. Defaults to 'standard'."
+        ),
+    )
+
     normalize_encoding_chars: str = Field(
         default="?#%+@",
         description="Characters to escape in S3 object keys as !HH hexadecimal bytes. "

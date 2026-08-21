@@ -186,7 +186,7 @@ where
 
     if matches!(
         service_err.err().code(),
-        Some("PreconditionFailed" | "ConditionalRequestConflict")
+        Some("PreconditionFailed" | "ConditionalRequestConflict" | "FileAlreadyExists")
     ) {
         return true;
     }

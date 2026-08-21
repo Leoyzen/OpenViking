@@ -374,6 +374,13 @@ def _get_backend_specific_params(item: Any) -> Any:
 def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
     """Serialize user-facing S3 config into Rust s3fs plugin parameters."""
     directory_marker_mode = _get_config_value(s3_config, "directory_marker_mode")
+    s3_vendor = _get_config_value(s3_config, "s3_vendor", "standard")
+    if s3_vendor == "standard":
+        # Legacy alias (pre-s3_vendor deployments): conditional write mode implied
+        # the Alibaba OSS vendor behavior, which is now selected via `s3_vendor`.
+        legacy_mode = _get_config_value(s3_config, "conditional_write_mode", "standard")
+        if legacy_mode == "oss_forbid_overwrite":
+            s3_vendor = "aliyun_oss"
     return {
         "bucket": _get_config_value(s3_config, "bucket"),
         "region": _get_config_value(s3_config, "region"),
@@ -383,7 +390,7 @@ def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
         "prefix": _get_config_value(s3_config, "prefix", ""),
         "disable_ssl": not _get_config_value(s3_config, "use_ssl", True),
         "use_path_style": _get_config_value(s3_config, "use_path_style", True),
-        "s3_vendor": _get_config_value(s3_config, "s3_vendor", "standard"),
+        "s3_vendor": s3_vendor,
         "directory_marker_mode": directory_marker_mode.value
         if hasattr(directory_marker_mode, "value")
         else directory_marker_mode,

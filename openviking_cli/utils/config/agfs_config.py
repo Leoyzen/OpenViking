@@ -63,6 +63,11 @@ class S3Config(BaseModel):
         description="true represent UsePathStyle for MinIO and some S3-compatible services; false represent VirtualHostStyle for TOS  and some S3-compatible services.",
     )
 
+    s3_vendor: Literal["standard", "aliyun_oss"] = Field(
+        default="standard",
+        description="S3 vendor behavior. Use 'aliyun_oss' for Alibaba Cloud OSS.",
+    )
+
     directory_marker_mode: DirectoryMarkerMode = Field(
         default=DirectoryMarkerMode.EMPTY,
         description="How to persist S3 directory markers: 'none' skips marker creation, 'empty' writes a zero-byte marker, and 'nonempty' writes a non-empty marker payload. Defaults to 'empty'.",
@@ -73,6 +78,15 @@ class S3Config(BaseModel):
         description="Disable batch delete (DeleteObjects) and use sequential single-object deletes instead. "
         "Required for S3-compatible services like Alibaba Cloud OSS that require a Content-MD5 header "
         "for DeleteObjects but AWS SDK v2 does not send it by default. Defaults to False.",
+    )
+
+    conditional_write_mode: Literal["standard", "oss_forbid_overwrite"] = Field(
+        default="standard",
+        description=(
+            "Deprecated alias for s3_vendor: 'oss_forbid_overwrite' is translated to "
+            "s3_vendor='aliyun_oss' when s3_vendor is left at its default. "
+            "Prefer setting s3_vendor directly. Defaults to 'standard'."
+        ),
     )
 
     normalize_encoding_chars: str = Field(

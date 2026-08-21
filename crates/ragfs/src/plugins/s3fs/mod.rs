@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use cache::{S3ListDirCache, S3StatCache};
-use client::{ListTreePage, S3Client};
+use client::{ListTreePage, S3Client, S3Vendor};
 use futures::stream::{self, StreamExt};
 use regex::Regex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1206,6 +1206,12 @@ impl S3FSPlugin {
                     "Use path-style addressing (bucket/key vs bucket.host/key)",
                 ),
                 ConfigParameter::optional(
+                    "s3_vendor",
+                    "string",
+                    "standard",
+                    "S3 vendor behavior: standard, aliyun_oss",
+                ),
+                ConfigParameter::optional(
                     "prefix",
                     "string",
                     "",
@@ -1414,6 +1420,8 @@ plugins:
                 ));
             }
         }
+
+        S3Vendor::from_config(&config.params)?;
 
         Ok(())
     }

@@ -18,6 +18,34 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ENCODED_SEGMENT_PREFIX: char = '!';
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
+/// S3-compatible vendor behavior selected by configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum S3Vendor {
+    /// Standard S3-compatible behavior.
+    Standard,
+    /// Alibaba Cloud OSS S3-compatible behavior.
+    AliyunOss,
+}
+
+impl S3Vendor {
+    /// Parse the S3 vendor option from plugin configuration.
+    ///
+    /// # Arguments
+    /// * `config` - S3FS plugin configuration.
+    ///
+    /// # Returns
+    /// The configured S3 vendor, or `Standard` when omitted.
+    pub(super) fn from_config(config: &HashMap<String, ConfigValue>) -> Result<Self> {
+        match config.get("s3_vendor").and_then(|v| v.as_string()) {
+            None | Some("") | Some("standard") => Ok(Self::Standard),
+            Some("aliyun_oss") => Ok(Self::AliyunOss),
+            Some(v) => Err(Error::config(format!(
+                "invalid s3_vendor: {v}; expected one of: standard, aliyun_oss"
+            ))),
+        }
+    }
+}
+
 fn partial_delete_error(bucket: &str, errors: &[aws_sdk_s3::types::Error]) -> Option<Error> {
     if errors.is_empty() {
         return None;
@@ -156,7 +184,7 @@ where
 
     if matches!(
         service_err.err().code(),
-        Some("PreconditionFailed" | "ConditionalRequestConflict")
+        Some("PreconditionFailed" | "ConditionalRequestConflict" | "FileAlreadyExists")
     ) {
         return true;
     }
@@ -369,6 +397,7 @@ pub struct S3Client {
     marker_mode: DirectoryMarkerMode,
     disable_batch_delete: bool,
     auto_detect_content_type: bool,
+    s3_vendor: S3Vendor,
 }
 
 impl S3Client {
@@ -396,6 +425,8 @@ impl S3Client {
             .and_then(|v| v.as_string())
             .unwrap_or("us-east-1")
             .to_string();
+
+        let s3_vendor = S3Vendor::from_config(config)?;
 
         let raw_endpoint = config.get("endpoint").and_then(|v| v.as_string());
         let use_ssl = if let Some(v) = config.get("use_ssl").and_then(|v| v.as_bool()) {
@@ -486,6 +517,7 @@ impl S3Client {
             marker_mode,
             disable_batch_delete,
             auto_detect_content_type,
+            s3_vendor,
         })
     }
 
@@ -1241,6 +1273,7 @@ mod tests {
             marker_mode: DirectoryMarkerMode::Empty,
             disable_batch_delete: false,
             auto_detect_content_type: false,
+            s3_vendor: S3Vendor::Standard,
         }
     }
 

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Content endpoints for OpenViking HTTP Server."""
 
+import base64
+import binascii
 from typing import Literal
 from urllib.parse import quote
 
@@ -38,12 +40,13 @@ logger = get_logger(__name__)
 
 
 class WriteContentRequest(BaseModel):
-    """Request to write, append, or create text content to a file."""
+    """Request to write, append, or create text or base64-encoded binary content."""
 
     model_config = ConfigDict(extra="forbid")
 
     uri: str
-    content: str
+    content: str | None = None
+    content_base64: str | None = None
     mode: str = "replace"
     wait: bool = False
     timeout: float | None = None
@@ -228,15 +231,27 @@ async def write(
     request: WriteContentRequest = Body(...),
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Write text content to a file (replace, append, or create) and refresh semantics/vectors."""
-    service = get_service()
+    """Write text or base64-encoded binary content to a file and refresh semantics/vectors."""
     uri = validate_request_viking_uri(resolve_path_variables(request.uri), _ctx)
+    content: str | bytes
+    if request.content is not None:
+        if request.content_base64 is not None:
+            raise InvalidArgumentError("exactly one of content or content_base64 is required")
+        content = request.content
+    elif request.content_base64 is not None:
+        try:
+            content = base64.b64decode(request.content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise InvalidArgumentError(f"content_base64 is invalid: {uri}") from exc
+    else:
+        raise InvalidArgumentError("exactly one of content or content_base64 is required")
+    service = get_service()
     execution = await run_operation(
         operation="content.write",
         telemetry=request.telemetry,
         fn=lambda: service.fs.write(
             uri=uri,
-            content=request.content,
+            content=content,
             ctx=_ctx,
             mode=request.mode,
             wait=request.wait,

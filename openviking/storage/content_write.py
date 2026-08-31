@@ -69,6 +69,9 @@ _CREATE_ALLOWED_EXTENSIONS = frozenset(
         ".md",
         ".txt",
         ".json",
+        ".jsonl",
+        ".log",
+        ".db",
         ".yaml",
         ".yml",
         ".toml",
@@ -108,6 +111,12 @@ class _BatchRefreshOutcome:
         return semantic_status, vector_status
 
 
+def _content_byte_size(content: str | bytes) -> int:
+    if isinstance(content, bytes):
+        return len(content)
+    return len(content.encode("utf-8"))
+
+
 class ContentWriteCoordinator:
     """Write a file (create or modify) and trigger downstream maintenance."""
 
@@ -119,7 +128,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
@@ -131,6 +140,11 @@ class ContentWriteCoordinator:
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
         self._ensure_content_write_policy(normalized_uri)
         self._viking_fs._ensure_mutable_access(normalized_uri, ctx)
+        if isinstance(content, bytes):
+            if context_type_for_uri(normalized_uri) == "memory":
+                raise InvalidArgumentError(f"binary content is not supported for memories: {uri}")
+            if mode == "append":
+                raise InvalidArgumentError(f"binary content does not support append mode: {uri}")
 
         if mode == "create":
             return await self._create_and_write(
@@ -162,10 +176,8 @@ class ContentWriteCoordinator:
             )
 
         context_type = context_type_for_uri(normalized_uri)
-        root_uri = await self._resolve_root_uri(
-            normalized_uri, ctx=ctx, anchor_to_parent=True
-        )
-        written_bytes = len(content.encode("utf-8"))
+        root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx, anchor_to_parent=True)
+        written_bytes = _content_byte_size(content)
         telemetry_id = get_current_telemetry().telemetry_id
 
         if context_type == "memory" and not is_abstract_overview_uri(normalized_uri):
@@ -762,7 +774,7 @@ class ContentWriteCoordinator:
         *,
         uri: str,
         root_uri: str,
-        content: str,
+        content: str | bytes,
         mode: str,
         response_mode: Optional[str] = None,
         context_type: str,
@@ -782,7 +794,7 @@ class ContentWriteCoordinator:
                 uri=uri,
             ) from exc
 
-        previous_content: Optional[str] = None
+        previous_content: str | bytes | None = None
         content_written = False
         post_process_started = False
         lock_released = False
@@ -790,7 +802,10 @@ class ContentWriteCoordinator:
         refresh_action: Optional[FreshnessAction] = None
         try:
             if mode != "create":
-                previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
+                if isinstance(content, bytes):
+                    previous_content = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+                else:
+                    previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             elif is_abstract_overview_uri(uri):
                 raise InvalidArgumentError(
                     f"cannot create generated abstract overview directly: {uri}"
@@ -903,7 +918,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        previous_content: Optional[str],
+        previous_content: str | bytes | None,
         mode: str,
         ctx: RequestContext,
         lease_ref: Optional[Dict[str, Any]] = None,
@@ -1031,7 +1046,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         wait: bool,
         timeout: Optional[float],
@@ -1052,7 +1067,7 @@ class ContentWriteCoordinator:
         root_uri = await self._resolve_root_uri(
             uri, ctx=ctx, _allow_not_found=True, anchor_to_parent=True
         )
-        written_bytes = len(content.encode("utf-8"))
+        written_bytes = _content_byte_size(content)
         telemetry_id = get_current_telemetry().telemetry_id
 
         if context_type == "memory":
@@ -1088,12 +1103,12 @@ class ContentWriteCoordinator:
     async def _write_in_place(
         self,
         uri: str,
-        content: str,
+        content: str | bytes,
         *,
         mode: str,
         ctx: RequestContext,
         lease_ref: Optional[Dict[str, Any]] = None,
-        existing_raw: Optional[str] = None,
+        existing_raw: str | bytes | None = None,
     ) -> None:
         if is_abstract_overview_uri(uri):
             current_raw = (
@@ -1201,7 +1216,7 @@ class ContentWriteCoordinator:
         *,
         uri: str,
         root_uri: str,
-        content: str,
+        content: str | bytes,
         mode: str,
         response_mode: Optional[str] = None,
         wait: bool,

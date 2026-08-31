@@ -16,6 +16,7 @@ from openviking.privacy import (
     get_skill_name_from_uri,
     restore_skill_content,
 )
+from openviking.core.uri_validation import validate_viking_uri
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
@@ -675,14 +676,15 @@ class FSService:
     async def write(
         self,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
         timeout: Optional[float] = None,
         processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
-        """Write to an existing file and refresh semantics/vectors."""
+        """Write text or raw bytes to a file and refresh semantics/vectors."""
+        uri = validate_viking_uri(uri)
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
         return await coordinator.write(

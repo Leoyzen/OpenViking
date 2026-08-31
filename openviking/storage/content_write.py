@@ -19,9 +19,10 @@ from openviking.core.namespace import (
 )
 from openviking.resource.processing_mode import (
     DEFAULT_PROCESSING_MODE,
+    NONE,
     VECTORS_ONLY,
-    ProcessingMode,
-    normalize_processing_mode,
+    WriteProcessingMode,
+    normalize_write_processing_mode,
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
@@ -123,10 +124,10 @@ class ContentWriteCoordinator:
         mode: str = "replace",
         wait: bool = False,
         timeout: Optional[float] = None,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         self._validate_mode(mode)
-        processing_mode = normalize_processing_mode(processing_mode)
+        processing_mode = normalize_write_processing_mode(processing_mode)
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
         self._ensure_content_write_policy(normalized_uri)
         self._viking_fs._ensure_mutable_access(normalized_uri, ctx)
@@ -770,7 +771,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         written_bytes: int,
         telemetry_id: str,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
@@ -815,6 +816,8 @@ class ContentWriteCoordinator:
                     ctx=ctx,
                 )
                 post_process_started = True
+            elif processing_mode == NONE:
+                post_process_started = True
             else:
                 refresh_action = await self._enqueue_semantic_refresh(
                     root_uri=root_uri,
@@ -854,6 +857,11 @@ class ContentWriteCoordinator:
                 result_kwargs = {
                     "semantic_status": "skipped",
                     "vector_status": vector_status,
+                }
+            elif processing_mode == NONE:
+                result_kwargs = {
+                    "semantic_status": "skipped",
+                    "vector_status": "skipped",
                 }
             elif refresh_action is FreshnessAction.MARK_PENDING:
                 # Changed-file semantic/vector work may still be queued, while
@@ -1027,7 +1035,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         wait: bool,
         timeout: Optional[float],
-        processing_mode: ProcessingMode,
+        processing_mode: WriteProcessingMode,
         result_mode: str = "create",
         validate_extension: bool = True,
     ) -> Dict[str, Any]:
@@ -1201,10 +1209,8 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         written_bytes: int,
         telemetry_id: str,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
-        del processing_mode
-
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
             lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
@@ -1220,6 +1226,19 @@ class ContentWriteCoordinator:
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             await self._viking_fs._async_agfs.pathlock_release(lease)
             released = True
+            if processing_mode == NONE:
+                return self._build_write_result(
+                    uri=uri,
+                    root_uri=root_uri,
+                    context_type="memory",
+                    mode=mode,
+                    written_bytes=written_bytes,
+                    wait=wait,
+                    queue_status=None,
+                    semantic_status="skipped",
+                    vector_status="skipped",
+                    overview_status="skipped",
+                )
             if wait and telemetry_id and self._vikingdb_has_queue():
                 get_request_wait_tracker().register_request(telemetry_id)
                 request_registered = True

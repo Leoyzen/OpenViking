@@ -17,7 +17,10 @@ from openviking.core.namespace import (
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
-from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
+from openviking.resource.processing_mode import (
+    DEFAULT_PROCESSING_MODE,
+    WriteProcessingMode,
+)
 from openviking.server.auth import (
     get_request_context,
     require_role,
@@ -45,7 +48,7 @@ class WriteContentRequest(BaseModel):
     wait: bool = False
     timeout: float | None = None
     telemetry: TelemetryRequest = False
-    processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
+    processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE
 
 
 class BatchWriteOperation(BaseModel):

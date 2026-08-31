@@ -17,7 +17,10 @@ from openviking.core.namespace import (
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
-from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
+from openviking.resource.processing_mode import (
+    DEFAULT_PROCESSING_MODE,
+    WriteProcessingMode,
+)
 from openviking.server.auth import (
     get_request_context,
     require_role,
@@ -46,9 +49,24 @@ class WriteContentRequest(BaseModel):
     wait: bool = False
     timeout: float | None = None
     telemetry: TelemetryRequest = False
-    processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
+    processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE
     tags: list[str] | None = None
     tag_mode: Literal["replace", "append"] = "replace"
+
+
+class BatchWritePrecondition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["create_if_absent", "replace_if_hash"]
+    base_hash: str | None = None
+
+    @model_validator(mode="after")
+    def validate_hash_shape(self) -> "BatchWritePrecondition":
+        if self.kind == "replace_if_hash" and not self.base_hash:
+            raise ValueError("base_hash is required for replace_if_hash")
+        if self.kind == "create_if_absent" and self.base_hash is not None:
+            raise ValueError("base_hash is not allowed for create_if_absent")
+        return self
 
 
 class BatchWriteOperation(BaseModel):

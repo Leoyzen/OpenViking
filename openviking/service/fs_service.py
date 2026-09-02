@@ -10,6 +10,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.core.context import ContextLevel
+from openviking.core.uri_validation import validate_viking_uri
 from openviking.core.namespace import classify_uri, context_type_for_uri, uri_leaf_name
 from openviking.privacy import (
     UserPrivacyConfigService,
@@ -822,7 +823,7 @@ class FSService:
     async def write(
         self,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
@@ -831,7 +832,8 @@ class FSService:
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
     ) -> Dict[str, Any]:
-        """Write to an existing file and refresh semantics/vectors."""
+        """Write text or raw bytes to a file and refresh semantics/vectors."""
+        uri = validate_viking_uri(uri)
         viking_fs = self._ensure_initialized()
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
         return await coordinator.write(

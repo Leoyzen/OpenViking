@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.core.context import ContextLevel
+from openviking.resource.processing_mode import (
+    normalize_processing_mode,
+    normalize_write_processing_mode,
+)
 from openviking.server.identity import RequestContext, Role
 from openviking.storage import content_write as content_write_module
 from openviking.storage.abstract_overview import (
@@ -16,6 +20,7 @@ from openviking.storage.abstract_overview import (
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
 from openviking.utils.ingest_options import IngestOptions
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -36,15 +41,25 @@ class _FakePathLock:
 
 class _FakeVikingFS:
     def __init__(self):
-        self.write_file = AsyncMock()
+        self.files: dict[str, bytes] = {}
+        self.write_file = AsyncMock(side_effect=self._store_write)
         self.read_file = AsyncMock(return_value="previous")
         self._async_agfs = _FakePathLock()
+
+    def _store_write(self, uri, content, ctx=None, lease_ref=None):
+        self.files[uri] = content if isinstance(content, bytes) else content.encode("utf-8")
 
     def _uri_to_path(self, uri, ctx=None):
         return f"/fake/{uri}"
 
     async def _ensure_access(self, uri, ctx, action):
         del uri, ctx, action
+
+    def _ensure_mutable_access(self, uri, ctx=None):
+        pass
+
+    async def read_file_bytes(self, uri, ctx=None):
+        return self.files[uri]
 
 
 def _sidecar(level=ContextLevel.ABSTRACT, body="Original body."):
@@ -295,3 +310,192 @@ async def test_memory_write_accepts_processing_mode_without_switching_refresh(
     assert result["context_type"] == "memory"
     assert result["semantic_status"] == "skipped"
     assert result["overview_status"] == expected_overview_status
+
+
+def test_normalize_write_processing_mode_accepts_none_but_ingest_rejects_it():
+    assert normalize_write_processing_mode("none") == "none"
+    assert normalize_write_processing_mode(None) == "semantic_and_vectors"
+    with pytest.raises(ValueError):
+        normalize_processing_mode("none")
+
+
+@pytest.mark.asyncio
+async def test_none_write_skips_semantic_refresh_and_vectorization(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    vectorize_file = AsyncMock(side_effect=AssertionError("vectorization should not run"))
+    monkeypatch.setattr(content_write_module, "vectorize_file", vectorize_file, raising=False)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._enqueue_semantic_refresh = AsyncMock(
+        side_effect=AssertionError("semantic refresh should not run")
+    )
+
+    result = await coordinator._write_direct_with_refresh(
+        uri="viking://resources/demo.md",
+        root_uri="viking://resources",
+        content="placeholder",
+        mode="replace",
+        context_type="resource",
+        wait=True,
+        timeout=1.0,
+        ctx=ctx,
+        written_bytes=11,
+        telemetry_id="tm-test",
+        processing_mode="none",
+    )
+
+    coordinator._enqueue_semantic_refresh.assert_not_awaited()
+    vectorize_file.assert_not_awaited()
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert fake_fs.write_file.await_args.args[:2] == ("viking://resources/demo.md", "placeholder")
+
+
+@pytest.mark.asyncio
+async def test_none_create_write_skips_semantic_refresh_and_vectorization(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    vectorize_file = AsyncMock(side_effect=AssertionError("vectorization should not run"))
+    monkeypatch.setattr(content_write_module, "vectorize_file", vectorize_file, raising=False)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._safe_stat = AsyncMock(return_value={"not_found": True})
+    coordinator._resolve_root_uri = AsyncMock(return_value="viking://resources")
+    coordinator._enqueue_semantic_refresh = AsyncMock(
+        side_effect=AssertionError("semantic refresh should not run")
+    )
+
+    result = await coordinator._create_and_write(
+        uri="viking://resources/new.md",
+        content="placeholder",
+        ctx=ctx,
+        wait=False,
+        timeout=None,
+        processing_mode="none",
+    )
+
+    coordinator._enqueue_semantic_refresh.assert_not_awaited()
+    vectorize_file.assert_not_awaited()
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert fake_fs.write_file.await_args.args[:2] == ("viking://resources/new.md", "placeholder")
+
+
+@pytest.mark.asyncio
+async def test_none_memory_write_skips_overview_and_embedding(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    refresh_overview = AsyncMock(side_effect=AssertionError("overview refresh should not run"))
+    refresh_embedding = AsyncMock(side_effect=AssertionError("embedding refresh should not run"))
+    monkeypatch.setattr(
+        content_write_module.MemoryUpdater,
+        "refresh_schema_overview",
+        refresh_overview,
+    )
+    monkeypatch.setattr(
+        content_write_module.MemoryUpdater,
+        "refresh_file_embedding",
+        refresh_embedding,
+    )
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._write_in_place = AsyncMock()
+
+    result = await coordinator._write_memory_with_refresh(
+        uri="viking://user/memories/demo.md",
+        root_uri="viking://user/memories",
+        content="placeholder",
+        mode="replace",
+        wait=True,
+        timeout=3.0,
+        ctx=ctx,
+        written_bytes=11,
+        telemetry_id="tm-test",
+        processing_mode="none",
+    )
+
+    refresh_overview.assert_not_awaited()
+    refresh_embedding.assert_not_awaited()
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert result["overview_status"] == "skipped"
+
+
+_DB_BYTES = b"\x00SQLite format 3\x00\xff\xfe\xd0\xdb\x00\x01binary\xff not utf-8"
+
+
+@pytest.mark.asyncio
+async def test_none_binary_create_writes_identical_bytes(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    vectorize_file = AsyncMock(side_effect=AssertionError("vectorization should not run"))
+    monkeypatch.setattr(content_write_module, "vectorize_file", vectorize_file, raising=False)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._safe_stat = AsyncMock(return_value={"not_found": True})
+    coordinator._resolve_root_uri = AsyncMock(return_value="viking://resources/draft")
+    coordinator._enqueue_semantic_refresh = AsyncMock(
+        side_effect=AssertionError("semantic refresh should not run")
+    )
+
+    result = await coordinator.write(
+        uri="viking://resources/draft/checkpoint.db",
+        content=_DB_BYTES,
+        ctx=ctx,
+        mode="create",
+        processing_mode="none",
+    )
+
+    coordinator._enqueue_semantic_refresh.assert_not_awaited()
+    vectorize_file.assert_not_awaited()
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert result["written_bytes"] == len(_DB_BYTES)
+    assert await fake_fs.read_file_bytes("viking://resources/draft/checkpoint.db") == _DB_BYTES
+
+
+@pytest.mark.asyncio
+async def test_none_binary_replace_reads_previous_bytes(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    fake_fs.files["viking://resources/draft/checkpoint.db"] = b"old-bytes"
+    vectorize_file = AsyncMock(side_effect=AssertionError("vectorization should not run"))
+    monkeypatch.setattr(content_write_module, "vectorize_file", vectorize_file, raising=False)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._safe_stat = AsyncMock(return_value={})
+    coordinator._resolve_root_uri = AsyncMock(return_value="viking://resources/draft")
+    coordinator._enqueue_semantic_refresh = AsyncMock(
+        side_effect=AssertionError("semantic refresh should not run")
+    )
+
+    result = await coordinator.write(
+        uri="viking://resources/draft/checkpoint.db",
+        content=_DB_BYTES,
+        ctx=ctx,
+        mode="replace",
+        processing_mode="none",
+    )
+
+    coordinator._enqueue_semantic_refresh.assert_not_awaited()
+    vectorize_file.assert_not_awaited()
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert await fake_fs.read_file_bytes("viking://resources/draft/checkpoint.db") == _DB_BYTES
+
+
+@pytest.mark.asyncio
+async def test_binary_write_rejected_for_memory_uri(ctx):
+    coordinator = ContentWriteCoordinator(viking_fs=_FakeVikingFS())
+
+    with pytest.raises(InvalidArgumentError, match="binary content is not supported"):
+        await coordinator.write(
+            uri="viking://user/user-1/memories/demo.md",
+            content=_DB_BYTES,
+            ctx=ctx,
+            mode="replace",
+        )
+
+
+@pytest.mark.asyncio
+async def test_binary_write_rejected_for_append_mode(ctx):
+    coordinator = ContentWriteCoordinator(viking_fs=_FakeVikingFS())
+
+    with pytest.raises(InvalidArgumentError, match="does not support append mode"):
+        await coordinator.write(
+            uri="viking://resources/draft/checkpoint.db",
+            content=_DB_BYTES,
+            ctx=ctx,
+            mode="append",
+        )

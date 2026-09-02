@@ -19,9 +19,10 @@ from openviking.core.namespace import (
 )
 from openviking.resource.processing_mode import (
     DEFAULT_PROCESSING_MODE,
+    NONE,
     VECTORS_ONLY,
-    ProcessingMode,
-    normalize_processing_mode,
+    WriteProcessingMode,
+    normalize_write_processing_mode,
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
@@ -70,6 +71,9 @@ _CREATE_ALLOWED_EXTENSIONS = frozenset(
         ".md",
         ".txt",
         ".json",
+        ".jsonl",
+        ".log",
+        ".db",
         ".yaml",
         ".yml",
         ".toml",
@@ -109,6 +113,12 @@ class _BatchRefreshOutcome:
         return semantic_status, vector_status
 
 
+def _content_byte_size(content: str | bytes) -> int:
+    if isinstance(content, bytes):
+        return len(content)
+    return len(content.encode("utf-8"))
+
+
 class ContentWriteCoordinator:
     """Write a file (create or modify) and trigger downstream maintenance."""
 
@@ -120,21 +130,26 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         mode: str = "replace",
         wait: bool = False,
         timeout: Optional[float] = None,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
         tags: list[str] | None = None,
         tag_mode: str = "replace",
     ) -> Dict[str, Any]:
         self._validate_mode(mode)
-        processing_mode = normalize_processing_mode(processing_mode)
+        processing_mode = normalize_write_processing_mode(processing_mode)
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
         self._ensure_content_write_policy(normalized_uri)
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
         ingest_options = IngestOptions.from_search_tags(tags, mode=tag_mode)
+        if isinstance(content, bytes):
+            if context_type_for_uri(normalized_uri) == "memory":
+                raise InvalidArgumentError(f"binary content is not supported for memories: {uri}")
+            if mode == "append":
+                raise InvalidArgumentError(f"binary content does not support append mode: {uri}")
 
         if mode == "create":
             return await self._create_and_write(
@@ -168,10 +183,8 @@ class ContentWriteCoordinator:
             )
 
         context_type = context_type_for_uri(normalized_uri)
-        root_uri = await self._resolve_root_uri(
-            normalized_uri, ctx=ctx, anchor_to_parent=True
-        )
-        written_bytes = len(content.encode("utf-8"))
+        root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx, anchor_to_parent=True)
+        written_bytes = _content_byte_size(content)
         telemetry_id = get_current_telemetry().telemetry_id
 
         if context_type == "memory" and not is_abstract_overview_uri(normalized_uri):
@@ -767,7 +780,7 @@ class ContentWriteCoordinator:
         *,
         uri: str,
         root_uri: str,
-        content: str,
+        content: str | bytes,
         mode: str,
         response_mode: Optional[str] = None,
         context_type: str,
@@ -776,7 +789,7 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         written_bytes: int,
         telemetry_id: str,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
         ingest_options: IngestOptions | None = None,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
@@ -788,7 +801,7 @@ class ContentWriteCoordinator:
                 uri=uri,
             ) from exc
 
-        previous_content: Optional[str] = None
+        previous_content: str | bytes | None = None
         content_written = False
         post_process_started = False
         lock_released = False
@@ -796,7 +809,10 @@ class ContentWriteCoordinator:
         refresh_action: Optional[FreshnessAction] = None
         try:
             if mode != "create":
-                previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
+                if isinstance(content, bytes):
+                    previous_content = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+                else:
+                    previous_content = await self._viking_fs.read_file(uri, ctx=ctx)
             elif is_abstract_overview_uri(uri):
                 raise InvalidArgumentError(
                     f"cannot create generated abstract overview directly: {uri}"
@@ -825,6 +841,8 @@ class ContentWriteCoordinator:
                     creator_acl_grant=(CreatorAclGrant.DIRECT if mode == "create" else None),
                     ingest_options=ingest_options,
                 )
+                post_process_started = True
+            elif processing_mode == NONE:
                 post_process_started = True
             else:
                 refresh_action = await self._enqueue_semantic_refresh(
@@ -867,6 +885,11 @@ class ContentWriteCoordinator:
                     "semantic_status": "skipped",
                     "vector_status": vector_status,
                 }
+            elif processing_mode == NONE:
+                result_kwargs = {
+                    "semantic_status": "skipped",
+                    "vector_status": "skipped",
+                }
             elif refresh_action is FreshnessAction.MARK_PENDING:
                 # Changed-file semantic/vector work may still be queued, while
                 # the directory aggregation itself is intentionally deferred.
@@ -907,7 +930,7 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        previous_content: Optional[str],
+        previous_content: str | bytes | None,
         mode: str,
         ctx: RequestContext,
         lease_ref: Optional[Dict[str, Any]] = None,
@@ -1052,11 +1075,11 @@ class ContentWriteCoordinator:
         self,
         *,
         uri: str,
-        content: str,
+        content: str | bytes,
         ctx: RequestContext,
         wait: bool,
         timeout: Optional[float],
-        processing_mode: ProcessingMode,
+        processing_mode: WriteProcessingMode,
         ingest_options: IngestOptions | None = None,
         result_mode: str = "create",
         validate_extension: bool = True,
@@ -1074,7 +1097,7 @@ class ContentWriteCoordinator:
         root_uri = await self._resolve_root_uri(
             uri, ctx=ctx, _allow_not_found=True, anchor_to_parent=True
         )
-        written_bytes = len(content.encode("utf-8"))
+        written_bytes = _content_byte_size(content)
         telemetry_id = get_current_telemetry().telemetry_id
 
         if context_type == "memory":
@@ -1112,12 +1135,12 @@ class ContentWriteCoordinator:
     async def _write_in_place(
         self,
         uri: str,
-        content: str,
+        content: str | bytes,
         *,
         mode: str,
         ctx: RequestContext,
         lease_ref: Optional[Dict[str, Any]] = None,
-        existing_raw: Optional[str] = None,
+        existing_raw: str | bytes | None = None,
     ) -> None:
         if is_abstract_overview_uri(uri):
             current_raw = (
@@ -1227,7 +1250,7 @@ class ContentWriteCoordinator:
         *,
         uri: str,
         root_uri: str,
-        content: str,
+        content: str | bytes,
         mode: str,
         response_mode: Optional[str] = None,
         wait: bool,
@@ -1235,11 +1258,9 @@ class ContentWriteCoordinator:
         ctx: RequestContext,
         written_bytes: int,
         telemetry_id: str,
-        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        processing_mode: WriteProcessingMode = DEFAULT_PROCESSING_MODE,
         ingest_options: IngestOptions | None = None,
     ) -> Dict[str, Any]:
-        del processing_mode
-
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
             lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
@@ -1255,6 +1276,19 @@ class ContentWriteCoordinator:
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             await self._viking_fs._async_agfs.pathlock_release(lease)
             released = True
+            if processing_mode == NONE:
+                return self._build_write_result(
+                    uri=uri,
+                    root_uri=root_uri,
+                    context_type="memory",
+                    mode=mode,
+                    written_bytes=written_bytes,
+                    wait=wait,
+                    queue_status=None,
+                    semantic_status="skipped",
+                    vector_status="skipped",
+                    overview_status="skipped",
+                )
             if wait and telemetry_id and self._vikingdb_has_queue():
                 get_request_wait_tracker().register_request(telemetry_id)
                 request_registered = True

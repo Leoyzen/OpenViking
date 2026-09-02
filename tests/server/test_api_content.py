@@ -3,6 +3,7 @@
 
 """Tests for content endpoints: read, abstract, overview, reindex."""
 
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,10 @@ import pytest
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import content as content_router
 from openviking.server.routers.content import ReindexRequest, WriteContentRequest, reindex
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
+
+_DB_BYTES = b"\x00SQLite format 3\x00\xff\xfebinary not utf-8"
 
 
 def test_write_content_request_accepts_processing_mode():
@@ -70,7 +74,7 @@ async def test_write_forwards_tags_and_tag_mode_to_service(monkeypatch):
 
     async def fake_write(**kwargs):
         seen.update(kwargs)
-        return {"uri": kwargs["uri"]}
+        return {"uri": kwargs["uri"], "semantic_status": "skipped"}
 
     service = SimpleNamespace(fs=SimpleNamespace(write=fake_write))
     monkeypatch.setattr(content_router, "get_service", lambda: service)
@@ -88,6 +92,69 @@ async def test_write_forwards_tags_and_tag_mode_to_service(monkeypatch):
 
     assert seen["tags"] == ["env=prod"]
     assert seen["tag_mode"] == "append"
+
+
+async def test_write_rejects_both_content_and_content_base64():
+    request = WriteContentRequest(
+        uri="viking://resources/demo.md",
+        content="updated",
+        content_base64=base64.b64encode(b"updated").decode("ascii"),
+    )
+    ctx = RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
+
+    with pytest.raises(InvalidArgumentError, match="exactly one of"):
+        await content_router.write(request, ctx)
+
+
+async def test_write_rejects_missing_content_and_content_base64():
+    request = WriteContentRequest(uri="viking://resources/demo.md")
+    ctx = RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
+
+    with pytest.raises(InvalidArgumentError, match="exactly one of"):
+        await content_router.write(request, ctx)
+
+
+async def test_write_decodes_base64_and_forwards_bytes(monkeypatch):
+    seen = {}
+
+    async def fake_write(**kwargs):
+        seen.update(kwargs)
+        return {"uri": kwargs["uri"], "semantic_status": "skipped"}
+
+    service = SimpleNamespace(fs=SimpleNamespace(write=fake_write))
+    monkeypatch.setattr(content_router, "get_service", lambda: service)
+    ctx = RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
+
+    response = await content_router.write(
+        WriteContentRequest(
+            uri="viking://resources/draft/checkpoint.db",
+            content_base64=base64.b64encode(_DB_BYTES).decode("ascii"),
+            mode="create",
+            processing_mode="none",
+        ),
+        ctx,
+    )
+
+    assert response["status"] == "ok"
+    assert seen["content"] == _DB_BYTES
+    assert seen["mode"] == "create"
+    assert seen["processing_mode"] == "none"
+
+
+async def test_write_rejects_invalid_base64(monkeypatch):
+    service = SimpleNamespace(fs=SimpleNamespace(write=None))
+    monkeypatch.setattr(content_router, "get_service", lambda: service)
+    ctx = RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
+
+    with pytest.raises(InvalidArgumentError, match="content_base64 is invalid"):
+        await content_router.write(
+            WriteContentRequest(
+                uri="viking://resources/draft/checkpoint.db",
+                content_base64="not valid base64!!!",
+                mode="create",
+            ),
+            ctx,
+        )
 
 
 async def _first_child_uri(client, uri: str) -> str:
